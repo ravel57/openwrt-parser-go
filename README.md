@@ -26,11 +26,17 @@ APP_IGNORE_VPN_INTERFACE=singbox
 
 Each application-created PBR policy contains metadata options `app_list`, `app_kind` and `app_address`. PBR ignores these unknown options, while the application uses them to find and manage only its own policies.
 
+## Immediate apply behavior
+
+Address-list writes are serialized and the HTTP request returns only after the PBR configuration has been committed and reloaded. For destination-domain items the backend then queries the local dnsmasq to prefill the `dnsmasq.nftset` set and deletes existing conntrack entries for all currently resolved destination IPs. For source-IP items it deletes conntrack entries originating from that IP/subnet. This makes new TCP/UDP connections follow the changed route immediately instead of waiting for DNS TTL, a new client lookup, or conntrack expiry.
+
+The `conntrack` package is optional at runtime, but without it already established browser/QUIC connections can continue over the previous route until they expire.
+
 ## Required OpenWrt packages
 
 ```sh
 apk update
-apk add pbr luci-app-pbr dnsmasq-full
+apk add pbr luci-app-pbr dnsmasq-full conntrack
 ```
 
 On OpenWrt 24.10 with `opkg`, replace `apk add` with `opkg install`.

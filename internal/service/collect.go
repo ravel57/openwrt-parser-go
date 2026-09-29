@@ -56,6 +56,29 @@ func (c *CollectService) Run(ctx context.Context) {
 				mDst[key{ip: ip, dns: dns}]++
 			}
 
+			// Keep DNS replies even when the corresponding connection has already
+			// disappeared from conntrack. Such entries are shown with zero active
+			// connections and can still be added to an address list from the UI.
+			dnsRows, dnsErr := c.connections.ow.DNSCache(ctx)
+			if dnsErr == nil {
+				for _, row := range dnsRows {
+					ip := strings.TrimSpace(row["data"])
+					dns := strings.TrimSpace(row["name"])
+					if dns == "" {
+						continue
+					}
+					if _, exists := mDNS[dns]; !exists {
+						mDNS[dns] = 0
+					}
+					if ip != "" {
+						k := key{ip: ip, dns: dns}
+						if _, exists := mDst[k]; !exists {
+							mDst[k] = 0
+						}
+					}
+				}
+			}
+
 			domainCounts := make([]storage.DomainCount, 0, len(mDNS))
 			for dns, cnt := range mDNS {
 				domainCounts = append(domainCounts, storage.DomainCount{DstDNS: dns, Count: cnt})
@@ -95,14 +118,9 @@ func (c *CollectService) GetByDNS(ctx context.Context, name string) ([]map[strin
 		}
 
 		key := strings.ToLower(dns)
-
 		a := byDNS[key]
 		if a == nil {
-			a = &agg{
-				dns:      dns,
-				ipsSeen:  map[string]struct{}{},
-				ipsSlice: []map[string]any{},
-			}
+			a = &agg{dns: dns, ipsSeen: map[string]struct{}{}, ipsSlice: []map[string]any{}}
 			byDNS[key] = a
 		}
 
@@ -110,22 +128,42 @@ func (c *CollectService) GetByDNS(ctx context.Context, name string) ([]map[strin
 		if r.UpdatedAt > a.updated {
 			a.updated = r.UpdatedAt
 		}
-
 		if _, exists := a.ipsSeen[ip]; !exists {
 			a.ipsSeen[ip] = struct{}{}
-			a.ipsSlice = append(a.ipsSlice, map[string]any{
-				"dstIP":  ip,
-				"dstDNS": dns,
-			})
+			a.ipsSlice = append(a.ipsSlice, map[string]any{"dstIP": ip, "dstDNS": dns})
+		}
+	}
+
+	domainRows, err := c.repo.FindDomainCountsLike(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range domainRows {
+		dns := strings.TrimSpace(r.DstDNS)
+		if dns == "" {
+			continue
+		}
+		key := strings.ToLower(dns)
+		a := byDNS[key]
+		if a == nil {
+			a = &agg{dns: dns, ipsSeen: map[string]struct{}{}, ipsSlice: []map[string]any{}}
+			byDNS[key] = a
+		}
+		// domain_conn_counts contains the total count for the hostname, while
+		// dst_conn_counts may contain several address rows. Keep the greater
+		// value instead of counting the same connections twice.
+		if r.Count > a.sum {
+			a.sum = r.Count
+		}
+		if r.UpdatedAt > a.updated {
+			a.updated = r.UpdatedAt
 		}
 	}
 
 	out := make([]map[string]any, 0, len(byDNS))
 	indexByDNS := map[string]int{}
-
 	for key, a := range byDNS {
 		enabled, _ := c.connections.IsIgnoreVPN(ctx, a.dns)
-
 		indexByDNS[key] = len(out)
 		out = append(out, map[string]any{
 			"dstDns":            a.dns,
@@ -136,31 +174,23 @@ func (c *CollectService) GetByDNS(ctx context.Context, name string) ([]map[strin
 		})
 	}
 
-	// Затем добавляем все домены из OpenWrt PBR.
-	// Благодаря этому настроенный домен отображается даже без активного
-	// соединения и без записи в SQLite.
-	addressList, err := c.connections.GetAddressList(
-		ctx,
-		c.connections.ignoreVPNListName,
-		name,
-	)
+	// Always include persistent PBR items, even when no active connection was
+	// sampled into SQLite. This makes add/enable/disable immediately visible in
+	// the existing DNS search screen.
+	addressList, err := c.connections.GetAddressList(ctx, c.connections.ignoreVPNListName, name)
 	if err != nil {
 		return nil, err
 	}
-
 	for _, item := range addressList {
 		dns := strings.TrimSpace(item.Address)
 		if dns == "" {
 			continue
 		}
-
 		key := strings.ToLower(dns)
-
 		if index, exists := indexByDNS[key]; exists {
 			out[index]["isIgnoreVpn"] = item.Enabled
 			continue
 		}
-
 		indexByDNS[key] = len(out)
 		out = append(out, map[string]any{
 			"dstDns":            dns,
@@ -174,12 +204,9 @@ func (c *CollectService) GetByDNS(ctx context.Context, name string) ([]map[strin
 	sort.Slice(out, func(i, j int) bool {
 		left := out[i]["activeConnections"].(int64)
 		right := out[j]["activeConnections"].(int64)
-
 		if left == right {
-			return strings.ToLower(out[i]["dstDns"].(string)) <
-				strings.ToLower(out[j]["dstDns"].(string))
+			return strings.ToLower(out[i]["dstDns"].(string)) < strings.ToLower(out[j]["dstDns"].(string))
 		}
-
 		return left > right
 	})
 

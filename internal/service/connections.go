@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"openwrt-parser-go/internal/domain"
@@ -15,6 +16,7 @@ type ConnectionsService struct {
 
 	ignoreVPNListName      string
 	ignoreLanToVpnListName string
+	addressListMu          sync.Mutex
 }
 
 func NewConnectionsService(ow *openwrt.Client, ignoreVPNListName, ignoreLanToVpnListName string) *ConnectionsService {
@@ -101,24 +103,6 @@ func (s *ConnectionsService) GetConnections(ctx context.Context) ([]domain.Conne
 			HostName: hostByIP[src],
 		})
 	}
-
-	// Добавляем DNS-записи даже тогда, когда короткое соединение
-	// уже исчезло из conntrack до очередного опроса.
-	seenDst := make(map[string]struct{}, len(out))
-	for _, connection := range out {
-		seenDst[connection.DstIP] = struct{}{}
-	}
-	for ip, dns := range dnsByIP {
-		if _, exists := seenDst[ip]; exists {
-			continue
-		}
-
-		out = append(out, domain.Connection{
-			DstIP:  ip,
-			DstDNS: dns,
-		})
-	}
-
 	return out, nil
 }
 
@@ -150,8 +134,15 @@ func (s *ConnectionsService) GetBySrc(ctx context.Context, srcIP string) ([]doma
 }
 
 func (s *ConnectionsService) PostDnsToIgnoreList(ctx context.Context, domains string, enabled bool) error {
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	s.addressListMu.Lock()
+	defer s.addressListMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+
+	requested := openwrt.SplitDomainsCSV(domains)
+	if len(requested) == 0 {
+		return nil
+	}
 
 	addresses, err := s.ow.AddressListIgnoreVPN(ctx, s.ignoreVPNListName)
 	if err != nil {
@@ -160,16 +151,22 @@ func (s *ConnectionsService) PostDnsToIgnoreList(ctx context.Context, domains st
 
 	byAddress := map[string]map[string]string{}
 	for _, r := range addresses {
-		if a := r["address"]; a != "" {
+		if a := strings.ToLower(strings.TrimSpace(r["address"])); a != "" {
 			byAddress[a] = r
 		}
 	}
 
-	for _, domain := range openwrt.SplitDomainsCSV(domains) {
-		row := byAddress[domain]
+	changed := make([]string, 0, len(requested))
+	for _, domain := range requested {
+		row := byAddress[strings.ToLower(domain)]
 		id := ""
+		currentEnabled := false
 		if row != nil {
 			id = row[".id"]
+			currentEnabled = row["disabled"] != "true"
+		}
+		if currentEnabled == enabled {
+			continue
 		}
 
 		if enabled {
@@ -177,20 +174,18 @@ func (s *ConnectionsService) PostDnsToIgnoreList(ctx context.Context, domains st
 				if err := s.ow.AddressListSetDisabled(ctx, id, false); err != nil {
 					return err
 				}
-			} else {
-				if err := s.ow.AddressListAdd(ctx, s.ignoreVPNListName, domain); err != nil {
-					return err
-				}
+			} else if err := s.ow.AddressListAdd(ctx, s.ignoreVPNListName, domain); err != nil {
+				return err
 			}
-		} else {
-			if id != "" {
-				if err := s.ow.AddressListSetDisabled(ctx, id, true); err != nil {
-					return err
-				}
+		} else if id != "" {
+			if err := s.ow.AddressListSetDisabled(ctx, id, true); err != nil {
+				return err
 			}
 		}
+		changed = append(changed, domain)
 	}
-	return s.ow.CommitAddressLists(ctx)
+
+	return s.ow.CommitAddressLists(ctx, s.ignoreVPNListName, changed...)
 }
 
 func (s *ConnectionsService) IsIgnoreVPN(ctx context.Context, dns string) (bool, error) {
@@ -306,7 +301,9 @@ func (s *ConnectionsService) GetIgnoreLanToVpn(ctx context.Context, find string)
 }
 
 func (s *ConnectionsService) PostIpToIgnoreLanToVpn(ctx context.Context, ip string, enabled bool) error {
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	s.addressListMu.Lock()
+	defer s.addressListMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	ip = strings.TrimSpace(ip)
@@ -320,11 +317,16 @@ func (s *ConnectionsService) PostIpToIgnoreLanToVpn(ctx context.Context, ip stri
 	}
 
 	var id string
+	currentEnabled := false
 	for _, r := range addresses {
 		if strings.TrimSpace(r["address"]) == ip {
 			id = r[".id"]
+			currentEnabled = r["disabled"] != "true"
 			break
 		}
+	}
+	if currentEnabled == enabled {
+		return nil
 	}
 
 	if enabled {
@@ -332,21 +334,16 @@ func (s *ConnectionsService) PostIpToIgnoreLanToVpn(ctx context.Context, ip stri
 			if err := s.ow.AddressListSetDisabled(ctx, id, false); err != nil {
 				return err
 			}
-		} else {
-			if err := s.ow.AddressListAdd(ctx, s.ignoreLanToVpnListName, ip); err != nil {
-				return err
-			}
+		} else if err := s.ow.AddressListAdd(ctx, s.ignoreLanToVpnListName, ip); err != nil {
+			return err
 		}
-		return s.ow.CommitAddressLists(ctx)
-	}
-
-	if id != "" {
+	} else if id != "" {
 		if err := s.ow.AddressListSetDisabled(ctx, id, true); err != nil {
 			return err
 		}
-		return s.ow.CommitAddressLists(ctx)
 	}
-	return nil
+
+	return s.ow.CommitAddressLists(ctx, s.ignoreLanToVpnListName, ip)
 }
 
 type AddressListItem struct {
@@ -380,18 +377,34 @@ func (s *ConnectionsService) GetAddressList(ctx context.Context, listName, find 
 }
 
 func (s *ConnectionsService) SetAddressListItem(ctx context.Context, listName, address string, enabled bool) error {
+	s.addressListMu.Lock()
+	defer s.addressListMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return nil
+	}
+
 	rows, err := s.ow.AddressListIgnoreVPN(ctx, listName)
 	if err != nil {
 		return err
 	}
-	address = strings.TrimSpace(address)
+
 	var id string
+	currentEnabled := false
 	for _, r := range rows {
 		if strings.EqualFold(strings.TrimSpace(r["address"]), address) {
 			id = r[".id"]
+			currentEnabled = r["disabled"] != "true"
 			break
 		}
 	}
+	if currentEnabled == enabled {
+		return nil
+	}
+
 	if id == "" {
 		if !enabled {
 			return nil
@@ -402,20 +415,27 @@ func (s *ConnectionsService) SetAddressListItem(ctx context.Context, listName, a
 	} else if err := s.ow.AddressListSetDisabled(ctx, id, !enabled); err != nil {
 		return err
 	}
-	return s.ow.CommitAddressLists(ctx)
+
+	return s.ow.CommitAddressLists(ctx, listName, address)
 }
 
 func (s *ConnectionsService) DeleteAddressListItem(ctx context.Context, listName, address string) error {
+	s.addressListMu.Lock()
+	defer s.addressListMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	address = strings.TrimSpace(address)
 	rows, err := s.ow.AddressListIgnoreVPN(ctx, listName)
 	if err != nil {
 		return err
 	}
 	for _, r := range rows {
-		if strings.EqualFold(strings.TrimSpace(r["address"]), strings.TrimSpace(address)) {
+		if strings.EqualFold(strings.TrimSpace(r["address"]), address) {
 			if err := s.ow.AddressListDelete(ctx, r[".id"]); err != nil {
 				return err
 			}
-			return s.ow.CommitAddressLists(ctx)
+			return s.ow.CommitAddressLists(ctx, listName, address)
 		}
 	}
 	return nil

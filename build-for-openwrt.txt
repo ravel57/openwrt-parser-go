@@ -1,0 +1,27 @@
+### ARM 64 ###
+docker buildx create --use --name mbuilder 2>/dev/null || true
+docker buildx use mbuilder
+
+docker buildx build \
+  --no-cache \
+  --platform linux/arm64 \
+  -t openwrt-parser:arm64 \
+  --load .
+
+docker save -o ./openwrt-parser-arm64.tar openwrt-parser:arm64
+
+skopeo copy --format v2s2 \
+  docker-archive:./openwrt-parser-arm64.tar:openwrt-parser:arm64 \
+  docker-archive:./openwrt-parser-arm64-docker.tar:openwrt-parser:latest
+
+
+### ARM v7 ###
+docker buildx build \
+  --no-cache \
+  --platform linux/arm/v7 \
+  -t openwrt-parser:latest \
+  --output type=oci,dest=./openwrt-parser-armv7-oci.tar .
+
+skopeo copy --format v2s2 \
+  oci-archive:./openwrt-parser-armv7-oci.tar \
+  docker-archive:./openwrt-parser-armv7-docker.tar:openwrt-parser:latest

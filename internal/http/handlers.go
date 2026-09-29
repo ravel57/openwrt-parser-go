@@ -38,6 +38,7 @@ func NewHandler(
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
@@ -210,7 +211,7 @@ func (h *Handler) postAddressList(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true})
+	writeJSON(w, 200, map[string]any{"ok": true, "address": req.Address, "enabled": req.Enabled})
 }
 
 func (h *Handler) deleteAddressList(w http.ResponseWriter, r *http.Request) {

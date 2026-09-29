@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,22 +28,38 @@ type ListSpec struct {
 }
 
 type Client struct {
-	runner         Runner
-	timeout        time.Duration
-	dhcpLeasesPath string
-	conntrackPath  string
-	dnsLogLines    int
-	specs          map[string]ListSpec
-	dnsMu          sync.RWMutex
-	dnsByIP        map[string]string
+	runner              Runner
+	timeout             time.Duration
+	dhcpLeasesPath      string
+	conntrackPath       string
+	dnsLogLines         int
+	singBoxConfigPath   string
+	singBoxApplyCommand string
+	specs               map[string]ListSpec
+	dnsMu               sync.RWMutex
+	dnsByIP             map[string]string
+	dnsNames            map[string]struct{}
+	applyMu             sync.Mutex
+	singBoxMu           sync.Mutex
 }
 
-func New(runner Runner, timeout time.Duration, dhcpLeasesPath, conntrackPath string, dnsLogLines int, specs ...ListSpec) *Client {
+func New(runner Runner, timeout time.Duration, dhcpLeasesPath, conntrackPath string, dnsLogLines int, singBoxConfigPath, singBoxApplyCommand string, specs ...ListSpec) *Client {
 	m := make(map[string]ListSpec, len(specs))
 	for _, s := range specs {
 		m[s.Name] = s
 	}
-	return &Client{runner: runner, timeout: timeout, dhcpLeasesPath: dhcpLeasesPath, conntrackPath: conntrackPath, dnsLogLines: dnsLogLines, specs: m, dnsByIP: map[string]string{}}
+	return &Client{
+		runner:              runner,
+		timeout:             timeout,
+		dhcpLeasesPath:      dhcpLeasesPath,
+		conntrackPath:       conntrackPath,
+		dnsLogLines:         dnsLogLines,
+		singBoxConfigPath:   singBoxConfigPath,
+		singBoxApplyCommand: singBoxApplyCommand,
+		specs:               m,
+		dnsByIP:             map[string]string{},
+		dnsNames:            map[string]struct{}{},
+	}
 }
 
 func (c *Client) Close() error { return c.runner.Close() }
@@ -58,26 +73,81 @@ func (c *Client) run(ctx context.Context, script string) (string, error) {
 	return c.runner.Run(ctx, script)
 }
 
+func (c *Client) runInput(ctx context.Context, script string, input []byte) (string, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	return c.runner.RunInput(ctx, script, input)
+}
+
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
 
-var dnsLogRE = regexp.MustCompile(`(?i)\bdnsmasq(?:\[[0-9]+\])?:\s+(?:reply|cached|config)\s+([^\s]+)\s+is\s+([^\s]+)`)
-
-func parseDNSLog(text string) map[string]string {
-	out := map[string]string{}
-	for _, line := range strings.Split(text, "\n") {
-		m := dnsLogRE.FindStringSubmatch(line)
-		if len(m) != 3 {
-			continue
-		}
-		name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(m[1])), ".")
-		ip := strings.TrimSpace(m[2])
-		parsed := net.ParseIP(ip)
-		if name == "" || parsed == nil || parsed.To4() == nil {
-			continue
-		}
-		out[ip] = name
+func normalizeDNSName(value string) string {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), ".")
+	name = strings.Trim(name, "[],")
+	if name == "" || net.ParseIP(name) != nil {
+		return ""
 	}
-	return out
+	if strings.HasSuffix(name, ".in-addr.arpa") || strings.HasSuffix(name, ".ip6.arpa") {
+		return ""
+	}
+	return name
+}
+
+func parseDNSLog(text string) (map[string]string, map[string]struct{}) {
+	byIP := map[string]string{}
+	names := map[string]struct{}{}
+
+	addName := func(raw string) string {
+		name := normalizeDNSName(raw)
+		if name != "" {
+			names[name] = struct{}{}
+		}
+		return name
+	}
+
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		for i := 0; i < len(fields); i++ {
+			token := strings.ToLower(fields[i])
+
+			// A browser-visible hostname is present in the query line even when
+			// dnsmasq later returns a CNAME. Recording queries prevents the
+			// original hostname from being lost in favour of the final CDN name.
+			if strings.HasPrefix(token, "query[") && strings.HasSuffix(token, "]") && i+1 < len(fields) {
+				queryType := strings.TrimSuffix(strings.TrimPrefix(token, "query["), "]")
+				if queryType != "ptr" {
+					addName(fields[i+1])
+				}
+				continue
+			}
+
+			if token != "reply" && token != "cached" && token != "config" {
+				continue
+			}
+			if i+3 >= len(fields) || !strings.EqualFold(fields[i+2], "is") {
+				continue
+			}
+
+			name := addName(fields[i+1])
+			if name == "" {
+				continue
+			}
+
+			ip := strings.Trim(strings.TrimSpace(fields[i+3]), "[],")
+			parsed := net.ParseIP(ip)
+			if parsed == nil {
+				continue
+			}
+
+			// Keep IPv4 and IPv6 associations. IPv6 may be disabled in PBR,
+			// but retaining it is still useful for displaying observed domains.
+			byIP[ip] = name
+		}
+	}
+	return byIP, names
 }
 
 func (c *Client) DNSCache(ctx context.Context) ([]map[string]string, error) {
@@ -86,25 +156,42 @@ func (c *Client) DNSCache(ctx context.Context) ([]map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	fresh := parseDNSLog(text)
+
+	freshByIP, freshNames := parseDNSLog(text)
+
 	c.dnsMu.Lock()
-	for ip, name := range fresh {
+	for ip, name := range freshByIP {
 		c.dnsByIP[ip] = name
 	}
-	snapshot := make(map[string]string, len(c.dnsByIP))
+	for name := range freshNames {
+		c.dnsNames[name] = struct{}{}
+	}
+
+	byIP := make(map[string]string, len(c.dnsByIP))
 	for ip, name := range c.dnsByIP {
-		snapshot[ip] = name
+		byIP[ip] = name
+	}
+	names := make([]string, 0, len(c.dnsNames))
+	for name := range c.dnsNames {
+		names = append(names, name)
 	}
 	c.dnsMu.Unlock()
 
-	keys := make([]string, 0, len(snapshot))
-	for ip := range snapshot {
-		keys = append(keys, ip)
+	sort.Strings(names)
+	ips := make([]string, 0, len(byIP))
+	for ip := range byIP {
+		ips = append(ips, ip)
 	}
-	sort.Strings(keys)
-	rows := make([]map[string]string, 0, len(keys))
-	for _, ip := range keys {
-		rows = append(rows, map[string]string{"data": ip, "name": snapshot[ip]})
+	sort.Strings(ips)
+
+	// A name-only row records every DNS query, including CNAME-based names
+	// that have no direct address in the dnsmasq reply log.
+	rows := make([]map[string]string, 0, len(names)+len(ips))
+	for _, name := range names {
+		rows = append(rows, map[string]string{"name": name})
+	}
+	for _, ip := range ips {
+		rows = append(rows, map[string]string{"data": ip, "name": byIP[ip]})
 	}
 	return rows, nil
 }
@@ -331,8 +418,89 @@ func (c *Client) AddressListDelete(ctx context.Context, id string) error {
 	return err
 }
 
-func (c *Client) CommitAddressLists(ctx context.Context) error {
-	_, err := c.run(ctx, "uci commit pbr && (/etc/init.d/pbr reload >/dev/null 2>&1 || /etc/init.d/pbr restart)")
+func (c *Client) CommitAddressLists(ctx context.Context, listName string, addresses ...string) error {
+	spec, err := c.listSpec(listName)
+	if err != nil {
+		return err
+	}
+
+	unique := make([]string, 0, len(addresses))
+	seen := make(map[string]struct{}, len(addresses))
+	for _, address := range addresses {
+		address = strings.TrimSpace(address)
+		if address == "" {
+			continue
+		}
+		key := strings.ToLower(address)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, address)
+	}
+	if len(unique) == 0 {
+		return nil
+	}
+
+	// UCI, PBR reload and conntrack cleanup must not overlap when the UI sends
+	// several toggle requests in quick succession.
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+
+	commands := []string{"set -eu"}
+
+	if spec.Kind == ListKindDestination {
+		commands = append(commands,
+			"ips_file=/tmp/openwrt-parser-ips.$$",
+			"trap 'rm -f \"$ips_file\"' EXIT",
+			": > \"$ips_file\"",
+		)
+		for _, address := range unique {
+			lookup := strings.TrimPrefix(address, "*.")
+			commands = append(commands,
+				"resolveip -4 "+shellQuote(lookup)+" >> \"$ips_file\" 2>/dev/null || true",
+			)
+		}
+	}
+
+	commands = append(commands,
+		"uci commit pbr",
+		"if /etc/init.d/pbr reload; then :; else /etc/init.d/pbr restart; fi",
+	)
+
+	switch spec.Kind {
+	case ListKindDestination:
+		for _, address := range unique {
+			lookup := strings.TrimPrefix(address, "*.")
+			commands = append(commands,
+				// Query local dnsmasq after the PBR reload. With dnsmasq.nftset
+				// this fills the newly created nft set immediately.
+				"if command -v nslookup >/dev/null 2>&1; then nslookup "+shellQuote(lookup)+" 127.0.0.1 >/dev/null 2>&1 || true; fi",
+				"resolveip -4 "+shellQuote(lookup)+" >> \"$ips_file\" 2>/dev/null || true",
+			)
+		}
+		commands = append(commands,
+			// Existing TCP and UDP sessions keep their old routing decision.
+			// Remove only sessions to the affected destination addresses.
+			"if command -v conntrack >/dev/null 2>&1; then",
+			"  awk '/^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$/ { print }' \"$ips_file\" | sort -u | while read -r ip; do",
+			"    [ -n \"$ip\" ] && conntrack -D -d \"$ip\" >/dev/null 2>&1 || true",
+			"  done",
+			"fi",
+		)
+	case ListKindSource:
+		commands = append(commands, "if command -v conntrack >/dev/null 2>&1; then")
+		for _, address := range unique {
+			commands = append(commands,
+				"  conntrack -D -s "+shellQuote(address)+" >/dev/null 2>&1 || true",
+			)
+		}
+		commands = append(commands, "fi")
+	default:
+		return fmt.Errorf("unsupported address-list kind %q", spec.Kind)
+	}
+
+	_, err = c.run(ctx, strings.Join(commands, "\n"))
 	return err
 }
 
