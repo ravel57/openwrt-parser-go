@@ -51,6 +51,8 @@ func main() {
 		cfg.OpenWrtDHCPLeasesPath,
 		cfg.OpenWrtConntrackPath,
 		cfg.OpenWrtDNSLogLines,
+		cfg.SingBoxConfigPath,
+		cfg.SingBoxApplyCommand,
 		openwrt.ListSpec{Name: cfg.IgnoreVPNListName, Kind: openwrt.ListKindDestination, Interface: cfg.IgnoreVPNInterface},
 		openwrt.ListSpec{Name: cfg.IgnoreLanToVpnListName, Kind: openwrt.ListKindSource, Interface: cfg.IgnoreLanToVpnInterface},
 	)
@@ -58,12 +60,14 @@ func main() {
 
 	connectionsSvc := service.NewConnectionsService(ow, cfg.IgnoreVPNListName, cfg.IgnoreLanToVpnListName)
 	collectSvc := service.NewCollectService(connectionsSvc, pg, cfg.CollectInterval)
+	singBoxSvc := service.NewSingBoxService(ow)
 
 	go collectSvc.Run(ctx)
 
 	h := httpapi.NewHandler(
 		connectionsSvc,
 		collectSvc,
+		singBoxSvc,
 		cfg.StaticDir,
 		cfg.IgnoreVPNListName,
 		cfg.IgnoreLanToVpnListName,

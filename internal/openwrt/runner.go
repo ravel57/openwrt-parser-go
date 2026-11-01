@@ -1,6 +1,7 @@
 package openwrt
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,13 +16,19 @@ import (
 
 type Runner interface {
 	Run(ctx context.Context, script string) (string, error)
+	RunInput(ctx context.Context, script string, input []byte) (string, error)
 	Close() error
 }
 
 type LocalRunner struct{}
 
 func (LocalRunner) Run(ctx context.Context, script string) (string, error) {
+	return LocalRunner{}.RunInput(ctx, script, nil)
+}
+
+func (LocalRunner) RunInput(ctx context.Context, script string, input []byte) (string, error) {
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", script)
+	cmd.Stdin = bytes.NewReader(input)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return string(out), fmt.Errorf("local command failed: %w: %s", err, strings.TrimSpace(string(out)))
@@ -69,6 +76,10 @@ func (r *SSHRunner) authMethods() ([]ssh.AuthMethod, error) {
 }
 
 func (r *SSHRunner) Run(ctx context.Context, script string) (string, error) {
+	return r.RunInput(ctx, script, nil)
+}
+
+func (r *SSHRunner) RunInput(ctx context.Context, script string, input []byte) (string, error) {
 	auth, err := r.authMethods()
 	if err != nil {
 		return "", err
@@ -98,6 +109,7 @@ func (r *SSHRunner) Run(ctx context.Context, script string) (string, error) {
 		return "", fmt.Errorf("OpenWrt SSH session: %w", err)
 	}
 	defer sess.Close()
+	sess.Stdin = bytes.NewReader(input)
 
 	type result struct {
 		out []byte

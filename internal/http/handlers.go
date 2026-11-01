@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 type Handler struct {
 	connections            *service.ConnectionsService
 	collect                *service.CollectService
+	singBox                *service.SingBoxService
 	staticDir              string
 	ignoreVPNListName      string
 	ignoreLanToVpnListName string
@@ -23,6 +25,7 @@ type Handler struct {
 func NewHandler(
 	connections *service.ConnectionsService,
 	collect *service.CollectService,
+	singBox *service.SingBoxService,
 	staticDir string,
 	ignoreVPNListName string,
 	ignoreLanToVpnListName string,
@@ -30,6 +33,7 @@ func NewHandler(
 	return &Handler{
 		connections:            connections,
 		collect:                collect,
+		singBox:                singBox,
 		staticDir:              staticDir,
 		ignoreVPNListName:      ignoreVPNListName,
 		ignoreLanToVpnListName: ignoreLanToVpnListName,
@@ -57,6 +61,8 @@ func (h *Handler) Router() http.Handler {
 		r.Get("/address-lists/{listName}", h.getAddressList)
 		r.Post("/address-lists/{listName}", h.postAddressList)
 		r.Delete("/address-lists/{listName}", h.deleteAddressList)
+		r.Get("/sing-box/config", h.getSingBoxConfig)
+		r.Post("/sing-box/config", h.postSingBoxConfig)
 	})
 
 	// Frontend (как в Spring: "/" -> index, + /js/**, /css/**, /favicon.ico)
@@ -85,6 +91,58 @@ func (h *Handler) Router() http.Handler {
 	}
 
 	return r
+}
+
+func (h *Handler) getSingBoxConfig(w http.ResponseWriter, r *http.Request) {
+	status, err := h.singBox.Status(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *Handler) postSingBoxConfig(w http.ResponseWriter, r *http.Request) {
+	const multipartOverhead = 256 * 1024
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxSingBoxConfigSize+multipartOverhead)
+	if err := r.ParseMultipartForm(256 * 1024); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid or oversized multipart upload"})
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+
+	file, header, err := r.FormFile("config")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "multipart field 'config' is required"})
+		return
+	}
+	defer file.Close()
+
+	contents, err := io.ReadAll(io.LimitReader(file, service.MaxSingBoxConfigSize+1))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "failed to read uploaded file"})
+		return
+	}
+	if int64(len(contents)) > service.MaxSingBoxConfigSize {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "configuration file is larger than 1 MiB"})
+		return
+	}
+
+	status, err := h.singBox.Install(r.Context(), contents)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"fileName":   filepath.Base(header.Filename),
+		"configured": status.Configured,
+		"path":       status.Path,
+		"size":       status.Size,
+		"running":    status.Running,
+	})
 }
 
 func dirExists(p string) bool {

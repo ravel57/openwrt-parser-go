@@ -84,6 +84,128 @@ func (c *Client) runInput(ctx context.Context, script string, input []byte) (str
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
 
+type SingBoxStatus struct {
+	Path       string `json:"path"`
+	Configured bool   `json:"configured"`
+	Size       int64  `json:"size"`
+	Running    bool   `json:"running"`
+}
+
+func (c *Client) SingBoxStatus(ctx context.Context) (SingBoxStatus, error) {
+	path := c.singBoxConfigPath
+	if path == "" {
+		return SingBoxStatus{}, errors.New("sing-box config path is not configured")
+	}
+
+	script := strings.Join([]string{
+		"config=" + shellQuote(path),
+		"if [ -s \"$config\" ]; then",
+		"  printf 'configured=true\\n'",
+		"  printf 'size=%s\\n' \"$(wc -c < \"$config\" | tr -d ' ')\"",
+		"else",
+		"  printf 'configured=false\\nsize=0\\n'",
+		"fi",
+		"if pidof sing-box >/dev/null 2>&1; then printf 'running=true\\n'; else printf 'running=false\\n'; fi",
+	}, "\n")
+	out, err := c.run(ctx, script)
+	if err != nil {
+		return SingBoxStatus{}, err
+	}
+
+	status := SingBoxStatus{Path: path}
+	for _, line := range strings.Split(out, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "configured":
+			status.Configured = value == "true"
+		case "size":
+			status.Size, _ = strconv.ParseInt(value, 10, 64)
+		case "running":
+			status.Running = value == "true"
+		}
+	}
+	return status, nil
+}
+
+func (c *Client) InstallSingBoxConfig(ctx context.Context, contents []byte) (SingBoxStatus, error) {
+	path := c.singBoxConfigPath
+	if path == "" {
+		return SingBoxStatus{}, errors.New("sing-box config path is not configured")
+	}
+
+	c.singBoxMu.Lock()
+	defer c.singBoxMu.Unlock()
+	if _, ok := ctx.Deadline(); !ok {
+		applyTimeout := c.timeout
+		if applyTimeout < 60*time.Second {
+			applyTimeout = 60 * time.Second
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, applyTimeout)
+		defer cancel()
+	}
+
+	// The uploaded bytes travel through stdin, not through the shell command.
+	// This avoids command-length limits and keeps credentials out of process
+	// arguments and error messages.
+	script := strings.Join([]string{
+		"set -eu",
+		"config=" + shellQuote(path),
+		"apply_command=" + shellQuote(c.singBoxApplyCommand),
+		"tmp=\"${config}.upload.$$\"",
+		"rollback=\"${config}.rollback.$$\"",
+		"apply_log=\"/tmp/openwrt-parser-sing-box-apply.$$\"",
+		"had_old=0",
+		"cleanup() { rm -f \"$tmp\" \"$rollback\" \"$apply_log\"; }",
+		"trap cleanup EXIT INT TERM",
+		"mkdir -p \"$(dirname \"$config\")\"",
+		"cat > \"$tmp\"",
+		"chmod 600 \"$tmp\"",
+		"command -v sing-box >/dev/null 2>&1 || { echo 'sing-box is not installed' >&2; exit 1; }",
+		"sing-box check -c \"$tmp\"",
+		"if [ -f \"$config\" ]; then cp -p \"$config\" \"$rollback\"; had_old=1; fi",
+		"mv \"$tmp\" \"$config\"",
+		"chmod 600 \"$config\"",
+		"set +e",
+		"if [ -n \"$apply_command\" ] && [ -x \"$apply_command\" ]; then",
+		"  \"$apply_command\" \"$config\" >\"$apply_log\" 2>&1",
+		"  apply_rc=$?",
+		"elif [ -x /etc/init.d/sing-box ]; then",
+		"  /etc/init.d/sing-box restart >\"$apply_log\" 2>&1",
+		"  apply_rc=$?",
+		"else",
+		"  echo 'sing-box init script is not installed' >\"$apply_log\"",
+		"  apply_rc=1",
+		"fi",
+		"if [ \"$apply_rc\" -eq 0 ]; then",
+		"  attempts=0",
+		"  while [ \"$attempts\" -lt 5 ] && ! pidof sing-box >/dev/null 2>&1; do attempts=$((attempts + 1)); sleep 1; done",
+		"  if ! pidof sing-box >/dev/null 2>&1; then echo 'sing-box did not stay running' >>\"$apply_log\"; apply_rc=1; fi",
+		"fi",
+		"set -e",
+		"if [ \"$apply_rc\" -ne 0 ]; then",
+		"  cat \"$apply_log\" >&2",
+		"  if [ \"$had_old\" -eq 1 ]; then",
+		"    cp -p \"$rollback\" \"$config\"",
+		"    if [ -n \"$apply_command\" ] && [ -x \"$apply_command\" ]; then \"$apply_command\" \"$config\" >/dev/null 2>&1 || true; else /etc/init.d/sing-box restart >/dev/null 2>&1 || true; fi",
+		"  else",
+		"    rm -f \"$config\"",
+		"    /etc/init.d/sing-box stop >/dev/null 2>&1 || true",
+		"  fi",
+		"  exit \"$apply_rc\"",
+		"fi",
+		"if [ \"$had_old\" -eq 1 ]; then cp -p \"$rollback\" \"${config}.before-panel\"; chmod 600 \"${config}.before-panel\"; fi",
+	}, "\n")
+
+	if _, err := c.runInput(ctx, script, contents); err != nil {
+		return SingBoxStatus{}, err
+	}
+	return c.SingBoxStatus(ctx)
+}
+
 func normalizeDNSName(value string) string {
 	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), ".")
 	name = strings.Trim(name, "[],")

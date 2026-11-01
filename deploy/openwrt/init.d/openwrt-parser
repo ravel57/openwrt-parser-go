@@ -10,6 +10,7 @@ start_service() {
     local enabled http_port sqlite_dsn collect_seconds dns_log_lines
     local ignore_vpn_list ignore_lan_to_vpn_list
     local ignore_vpn_interface ignore_lan_to_vpn_interface
+    local singbox_config_path singbox_apply_command
 
     config_get_bool enabled main enabled 1
     [ "$enabled" -eq 1 ] || return 0
@@ -22,6 +23,8 @@ start_service() {
     config_get ignore_lan_to_vpn_list main ignore_lan_to_vpn_list ignoreLanToVpn
     config_get ignore_vpn_interface main ignore_vpn_interface wan
     config_get ignore_lan_to_vpn_interface main ignore_lan_to_vpn_interface wan
+    config_get singbox_config_path main singbox_config_path /etc/sing-box/config.json
+    config_get singbox_apply_command main singbox_apply_command /usr/libexec/lan-mode-vpn-setup
 
     mkdir -p /var/lib/openwrt-parser
 
@@ -38,6 +41,8 @@ start_service() {
         APP_IGNORE_LAN_TO_VPN_LIST="$ignore_lan_to_vpn_list" \
         APP_IGNORE_VPN_INTERFACE="$ignore_vpn_interface" \
         APP_IGNORE_LAN_TO_VPN_INTERFACE="$ignore_lan_to_vpn_interface" \
+        APP_SINGBOX_CONFIG_PATH="$singbox_config_path" \
+        APP_SINGBOX_APPLY_COMMAND="$singbox_apply_command" \
         APP_COLLECT_SECONDS="$collect_seconds" \
         APP_STATIC_DIR=/usr/share/openwrt-parser/web
     procd_set_param respawn 3600 5 5

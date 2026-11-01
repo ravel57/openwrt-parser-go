@@ -72,6 +72,8 @@ export APP_OPENWRT_MODE=local
 export APP_OPENWRT_DHCP_LEASES_PATH=/tmp/dhcp.leases
 export APP_OPENWRT_CONNTRACK_PATH=/proc/net/nf_conntrack
 export APP_OPENWRT_DNS_LOG_LINES=4000
+export APP_SINGBOX_CONFIG_PATH=/etc/sing-box/config.json
+export APP_SINGBOX_APPLY_COMMAND=/usr/libexec/lan-mode-vpn-setup
 
 export APP_IGNORE_VPN_LIST=ignoreVpn
 export APP_IGNORE_LAN_TO_VPN_LIST=ignoreLanToVpn
@@ -82,18 +84,42 @@ export APP_COLLECT_SECONDS=10
 
 The provided procd files are under `deploy/openwrt`.
 
+For the prebuilt ARM64 bundle, copy/extract the project on the router and run:
+
+```sh
+chmod 755 deploy/openwrt/install.sh
+deploy/openwrt/install.sh
+```
+
+The installer preserves an existing `/etc/config/openwrt-parser`, replaces the
+binary/frontend/init script, enables the service and restarts it.
+
 Example installation after cross-compiling the binary:
 
 ```sh
 mkdir -p /var/lib/openwrt-parser
+mkdir -p /usr/share/openwrt-parser/web
 cp openwrt-parser /usr/bin/openwrt-parser
 chmod +x /usr/bin/openwrt-parser
+cp -R web/dist/. /usr/share/openwrt-parser/web/
 cp deploy/openwrt/init.d/openwrt-parser /etc/init.d/openwrt-parser
 cp deploy/openwrt/etc/config/openwrt-parser /etc/config/openwrt-parser
 chmod +x /etc/init.d/openwrt-parser
 /etc/init.d/openwrt-parser enable
 /etc/init.d/openwrt-parser start
 ```
+
+The panel is then available at `http://ROUTER_IP:8080/`. Its `sing-box` tab
+accepts a JSON configuration up to 1 MiB. The backend runs `sing-box check`,
+installs the file as `/etc/sing-box/config.json`, and invokes
+`/usr/libexec/lan-mode-vpn-setup` when that helper is installed. If applying
+the new configuration fails, the previous file is restored and applied again.
+After a successful update, the previous version remains available as
+`/etc/sing-box/config.json.before-panel`.
+
+The config path and apply helper can also be changed in
+`/etc/config/openwrt-parser` with `singbox_config_path` and
+`singbox_apply_command`.
 
 ## Docker/remote SSH mode
 
@@ -135,6 +161,8 @@ Generic address-list API added:
 - `GET /api/v1/address-lists/{listName}?find=...`
 - `POST /api/v1/address-lists/{listName}` with JSON `{ "address": "example.com", "enabled": true }`
 - `DELETE /api/v1/address-lists/{listName}?address=example.com`
+- `GET /api/v1/sing-box/config`
+- `POST /api/v1/sing-box/config` as `multipart/form-data`, file field `config`
 
 Only lists configured through `APP_IGNORE_VPN_LIST` and `APP_IGNORE_LAN_TO_VPN_LIST` are accepted.
 

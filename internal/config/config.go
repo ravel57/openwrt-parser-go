@@ -21,6 +21,8 @@ type Config struct {
 	OpenWrtDHCPLeasesPath  string
 	OpenWrtConntrackPath   string
 	OpenWrtDNSLogLines     int
+	SingBoxConfigPath      string
+	SingBoxApplyCommand    string
 
 	IgnoreVPNListName       string
 	IgnoreLanToVpnListName  string
@@ -107,6 +109,14 @@ func Load() Config {
 	if conntrackPath == "" {
 		conntrackPath = "/proc/net/nf_conntrack"
 	}
+	singBoxConfigPath := strings.TrimSpace(os.Getenv("APP_SINGBOX_CONFIG_PATH"))
+	if singBoxConfigPath == "" {
+		singBoxConfigPath = "/etc/sing-box/config.json"
+	}
+	singBoxApplyCommand := strings.TrimSpace(os.Getenv("APP_SINGBOX_APPLY_COMMAND"))
+	if singBoxApplyCommand == "" {
+		singBoxApplyCommand = "/usr/libexec/lan-mode-vpn-setup"
+	}
 
 	return Config{
 		HTTPPort:                port,
@@ -121,6 +131,8 @@ func Load() Config {
 		OpenWrtDHCPLeasesPath:   leasePath,
 		OpenWrtConntrackPath:    conntrackPath,
 		OpenWrtDNSLogLines:      envInt("APP_OPENWRT_DNS_LOG_LINES", 4000),
+		SingBoxConfigPath:       singBoxConfigPath,
+		SingBoxApplyCommand:     singBoxApplyCommand,
 		IgnoreVPNListName:       ignoreVPN,
 		IgnoreLanToVpnListName:  ignoreClient,
 		IgnoreVPNInterface:      ignoreVPNInterface,
