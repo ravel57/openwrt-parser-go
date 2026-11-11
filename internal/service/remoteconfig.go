@@ -108,6 +108,12 @@ func (s *RemoteConfigService) ListServers(ctx context.Context) ([]RemoteServer, 
 	return servers, nil
 }
 
+// ActiveSelection returns the last successfully applied (server, protocol)
+// pair without contacting the remote configs server.
+func (s *RemoteConfigService) ActiveSelection(ctx context.Context) (server, protocol string, err error) {
+	return s.activeSelection(ctx)
+}
+
 func (s *RemoteConfigService) activeSelection(ctx context.Context) (server, protocol string, err error) {
 	server, _, err = s.store.GetSetting(ctx, settingKeyUltunnelActiveServer)
 	if err != nil {

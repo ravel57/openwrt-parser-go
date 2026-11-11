@@ -206,6 +206,106 @@ func (c *Client) InstallSingBoxConfig(ctx context.Context, contents []byte) (Sin
 	return c.SingBoxStatus(ctx)
 }
 
+func (c *Client) InterfaceCounters(ctx context.Context, iface string) (rxBytes, txBytes int64, err error) {
+	iface = strings.TrimSpace(iface)
+	if iface == "" {
+		return 0, 0, errors.New("interface name is not configured")
+	}
+	script := strings.Join([]string{
+		"cat /sys/class/net/" + shellQuote(iface) + "/statistics/rx_bytes 2>/dev/null || echo 0",
+		"cat /sys/class/net/" + shellQuote(iface) + "/statistics/tx_bytes 2>/dev/null || echo 0",
+	}, "\n")
+	out, err := c.run(ctx, script)
+	if err != nil {
+		return 0, 0, err
+	}
+	lines := strings.Fields(out)
+	if len(lines) < 2 {
+		return 0, 0, fmt.Errorf("unexpected interface counters output: %q", out)
+	}
+	rxBytes, _ = strconv.ParseInt(strings.TrimSpace(lines[0]), 10, 64)
+	txBytes, _ = strconv.ParseInt(strings.TrimSpace(lines[1]), 10, 64)
+	return rxBytes, txBytes, nil
+}
+
+// CPUTimes reads the aggregate "cpu" line of /proc/stat and returns the idle
+// and total jiffy counters, for the caller to diff between two samples.
+func (c *Client) CPUTimes(ctx context.Context) (idle, total uint64, err error) {
+	out, err := c.run(ctx, "grep '^cpu ' /proc/stat")
+	if err != nil {
+		return 0, 0, err
+	}
+	fields := strings.Fields(out)
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0, fmt.Errorf("unexpected /proc/stat output: %q", out)
+	}
+	values := make([]uint64, 0, len(fields)-1)
+	for _, f := range fields[1:] {
+		n, convErr := strconv.ParseUint(f, 10, 64)
+		if convErr != nil {
+			break
+		}
+		values = append(values, n)
+		total += n
+	}
+	if len(values) < 4 {
+		return 0, 0, fmt.Errorf("unexpected /proc/stat fields: %q", out)
+	}
+	// idle (index 3) + iowait (index 4, when present)
+	idle = values[3]
+	if len(values) > 4 {
+		idle += values[4]
+	}
+	return idle, total, nil
+}
+
+type SystemInfo struct {
+	UptimeSeconds  float64
+	LoadAvg1       float64
+	MemTotalKB     int64
+	MemAvailableKB int64
+}
+
+func (c *Client) SystemInfo(ctx context.Context) (SystemInfo, error) {
+	script := "cat /proc/uptime; echo '---'; cat /proc/loadavg; echo '---'; cat /proc/meminfo | grep -E 'MemTotal|MemAvailable'"
+	out, err := c.run(ctx, script)
+	if err != nil {
+		return SystemInfo{}, err
+	}
+
+	var info SystemInfo
+	parts := strings.Split(out, "---")
+	if len(parts) >= 1 {
+		fields := strings.Fields(parts[0])
+		if len(fields) >= 1 {
+			info.UptimeSeconds, _ = strconv.ParseFloat(fields[0], 64)
+		}
+	}
+	if len(parts) >= 2 {
+		fields := strings.Fields(parts[1])
+		if len(fields) >= 1 {
+			info.LoadAvg1, _ = strconv.ParseFloat(fields[0], 64)
+		}
+	}
+	if len(parts) >= 3 {
+		for _, line := range strings.Split(parts[2], "\n") {
+			key, value, ok := strings.Cut(line, ":")
+			if !ok {
+				continue
+			}
+			value = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(value), "kB"))
+			n, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			switch strings.TrimSpace(key) {
+			case "MemTotal":
+				info.MemTotalKB = n
+			case "MemAvailable":
+				info.MemAvailableKB = n
+			}
+		}
+	}
+	return info, nil
+}
+
 func normalizeDNSName(value string) string {
 	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), ".")
 	name = strings.Trim(name, "[],")

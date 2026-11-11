@@ -4,19 +4,104 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"openwrt-parser-go/internal/storage"
 )
 
 type CollectService struct {
-	connections *ConnectionsService
-	repo        *storage.Sqlite
-	interval    time.Duration
+	connections    *ConnectionsService
+	repo           *storage.Sqlite
+	interval       time.Duration
+	statsInterface string
+
+	throughputMu sync.RWMutex
+	lastRxBytes  int64
+	lastTxBytes  int64
+	lastSampleAt time.Time
+	currentSpeed ThroughputSample
+
+	cpuMu           sync.RWMutex
+	lastCPUIdle     uint64
+	lastCPUTotal    uint64
+	lastCPUSampleAt time.Time
+	currentCPU      float64
 }
 
-func NewCollectService(connections *ConnectionsService, repo *storage.Sqlite, interval time.Duration) *CollectService {
-	return &CollectService{connections: connections, repo: repo, interval: interval}
+type ThroughputSample struct {
+	DownloadBytesPerSec float64 `json:"downloadBytesPerSec"`
+	UploadBytesPerSec   float64 `json:"uploadBytesPerSec"`
+	UpdatedAt           string  `json:"updatedAt"`
+}
+
+func NewCollectService(connections *ConnectionsService, repo *storage.Sqlite, interval time.Duration, statsInterface string) *CollectService {
+	return &CollectService{connections: connections, repo: repo, interval: interval, statsInterface: statsInterface}
+}
+
+// CurrentThroughput returns the most recently sampled interface rate. It is
+// zero-valued until the first two samples have been collected.
+func (c *CollectService) CurrentThroughput() ThroughputSample {
+	c.throughputMu.RLock()
+	defer c.throughputMu.RUnlock()
+	return c.currentSpeed
+}
+
+func (c *CollectService) sampleThroughput(ctx context.Context) {
+	if strings.TrimSpace(c.statsInterface) == "" {
+		return
+	}
+	rx, tx, err := c.connections.ow.InterfaceCounters(ctx, c.statsInterface)
+	if err != nil {
+		return
+	}
+
+	now := time.Now()
+	c.throughputMu.Lock()
+	defer c.throughputMu.Unlock()
+
+	if !c.lastSampleAt.IsZero() {
+		elapsed := now.Sub(c.lastSampleAt).Seconds()
+		if elapsed > 0 && rx >= c.lastRxBytes && tx >= c.lastTxBytes {
+			c.currentSpeed = ThroughputSample{
+				DownloadBytesPerSec: float64(rx-c.lastRxBytes) / elapsed,
+				UploadBytesPerSec:   float64(tx-c.lastTxBytes) / elapsed,
+				UpdatedAt:           now.UTC().Format(time.RFC3339),
+			}
+		}
+	}
+	c.lastRxBytes = rx
+	c.lastTxBytes = tx
+	c.lastSampleAt = now
+}
+
+// CurrentCPUUsagePercent returns the most recently sampled CPU usage,
+// averaged over the time between the last two samples. Zero until the first
+// two samples have been collected.
+func (c *CollectService) CurrentCPUUsagePercent() float64 {
+	c.cpuMu.RLock()
+	defer c.cpuMu.RUnlock()
+	return c.currentCPU
+}
+
+func (c *CollectService) sampleCPU(ctx context.Context) {
+	idle, total, err := c.connections.ow.CPUTimes(ctx)
+	if err != nil {
+		return
+	}
+
+	now := time.Now()
+	c.cpuMu.Lock()
+	defer c.cpuMu.Unlock()
+
+	if !c.lastCPUSampleAt.IsZero() && total > c.lastCPUTotal && idle >= c.lastCPUIdle {
+		totalDelta := total - c.lastCPUTotal
+		idleDelta := idle - c.lastCPUIdle
+		c.currentCPU = 100 * (1 - float64(idleDelta)/float64(totalDelta))
+	}
+	c.lastCPUIdle = idle
+	c.lastCPUTotal = total
+	c.lastCPUSampleAt = now
 }
 
 func (c *CollectService) Run(ctx context.Context) {
@@ -33,6 +118,9 @@ func (c *CollectService) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			c.sampleThroughput(ctx)
+			c.sampleCPU(ctx)
+
 			conns, err := c.connections.GetConnections(ctx)
 			if err != nil {
 				continue

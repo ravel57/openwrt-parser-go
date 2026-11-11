@@ -200,6 +200,47 @@ func (p *Sqlite) FindDomainCountsLike(ctx context.Context, q string) ([]DomainCo
 	return out, rows.Err()
 }
 
+func (p *Sqlite) TopDomainCounts(ctx context.Context, limit int) ([]DomainCount, error) {
+	rows, err := p.db.QueryContext(ctx, `
+		select dst_dns, active_connections, updated_at
+		  from domain_conn_counts
+		 where active_connections > 0
+		 order by active_connections desc, dst_dns asc
+		 limit ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []DomainCount
+	for rows.Next() {
+		var dc DomainCount
+		if err := rows.Scan(&dc.DstDNS, &dc.Count, &dc.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, dc)
+	}
+	return out, rows.Err()
+}
+
+type DomainStatsSummary struct {
+	TrackedDomains      int64
+	TrackedDestinations int64
+	ActiveConnections   int64
+}
+
+func (p *Sqlite) DomainStatsSummary(ctx context.Context) (DomainStatsSummary, error) {
+	var s DomainStatsSummary
+	err := p.db.QueryRowContext(ctx, `
+		select
+			(select count(*) from domain_conn_counts),
+			(select count(*) from dst_conn_counts),
+			(select coalesce(sum(active_connections), 0) from domain_conn_counts)
+	`).Scan(&s.TrackedDomains, &s.TrackedDestinations, &s.ActiveConnections)
+	return s, err
+}
+
 func (p *Sqlite) UpsertDstCounts(ctx context.Context, counts []DstCount) error {
 	if len(counts) == 0 {
 		return nil

@@ -31,6 +31,7 @@ type Config struct {
 	IgnoreLanToVpnListName  string
 	IgnoreVPNInterface      string
 	IgnoreLanToVpnInterface string
+	StatsInterface          string
 
 	CollectInterval time.Duration
 	StaticDir       string
@@ -98,6 +99,10 @@ func Load() Config {
 	if ignoreClientInterface == "" {
 		ignoreClientInterface = directInterface
 	}
+	statsInterface := strings.TrimSpace(os.Getenv("APP_STATS_INTERFACE"))
+	if statsInterface == "" {
+		statsInterface = directInterface
+	}
 
 	user := strings.TrimSpace(os.Getenv("APP_OPENWRT_USER"))
 	if user == "" {
@@ -151,6 +156,7 @@ func Load() Config {
 		IgnoreLanToVpnListName:  ignoreClient,
 		IgnoreVPNInterface:      ignoreVPNInterface,
 		IgnoreLanToVpnInterface: ignoreClientInterface,
+		StatsInterface:          statsInterface,
 		CollectInterval:         time.Duration(collectSeconds) * time.Second,
 		StaticDir:               staticDir,
 	}

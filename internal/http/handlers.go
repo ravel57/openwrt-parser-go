@@ -18,6 +18,7 @@ type Handler struct {
 	collect                *service.CollectService
 	singBox                *service.SingBoxService
 	remoteConfig           *service.RemoteConfigService
+	stats                  *service.StatsService
 	staticDir              string
 	ignoreVPNListName      string
 	ignoreLanToVpnListName string
@@ -28,6 +29,7 @@ func NewHandler(
 	collect *service.CollectService,
 	singBox *service.SingBoxService,
 	remoteConfig *service.RemoteConfigService,
+	stats *service.StatsService,
 	staticDir string,
 	ignoreVPNListName string,
 	ignoreLanToVpnListName string,
@@ -37,6 +39,7 @@ func NewHandler(
 		collect:                collect,
 		singBox:                singBox,
 		remoteConfig:           remoteConfig,
+		stats:                  stats,
 		staticDir:              staticDir,
 		ignoreVPNListName:      ignoreVPNListName,
 		ignoreLanToVpnListName: ignoreLanToVpnListName,
@@ -70,6 +73,7 @@ func (h *Handler) Router() http.Handler {
 		r.Post("/remote-configs/secret-key", h.postRemoteConfigSecretKey)
 		r.Get("/remote-configs/servers", h.getRemoteConfigServers)
 		r.Post("/remote-configs/apply", h.postRemoteConfigApply)
+		r.Get("/stats", h.getStats)
 	})
 
 	// Frontend (как в Spring: "/" -> index, + /js/**, /css/**, /favicon.ico)
@@ -212,6 +216,15 @@ func (h *Handler) postRemoteConfigApply(w http.ResponseWriter, r *http.Request) 
 		"size":       status.Size,
 		"running":    status.Running,
 	})
+}
+
+func (h *Handler) getStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := h.stats.Get(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
 }
 
 func dirExists(p string) bool {
