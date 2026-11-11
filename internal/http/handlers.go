@@ -7,10 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"openwrt-parser-go/internal/service"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/gorilla/websocket"
 )
 
 type Handler struct {
@@ -22,6 +24,7 @@ type Handler struct {
 	staticDir              string
 	ignoreVPNListName      string
 	ignoreLanToVpnListName string
+	statsPushInterval      time.Duration
 }
 
 func NewHandler(
@@ -33,6 +36,7 @@ func NewHandler(
 	staticDir string,
 	ignoreVPNListName string,
 	ignoreLanToVpnListName string,
+	statsPushInterval time.Duration,
 ) *Handler {
 	return &Handler{
 		connections:            connections,
@@ -43,7 +47,12 @@ func NewHandler(
 		staticDir:              staticDir,
 		ignoreVPNListName:      ignoreVPNListName,
 		ignoreLanToVpnListName: ignoreLanToVpnListName,
+		statsPushInterval:      statsPushInterval,
 	}
+}
+
+var statsWSUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -74,6 +83,7 @@ func (h *Handler) Router() http.Handler {
 		r.Get("/remote-configs/servers", h.getRemoteConfigServers)
 		r.Post("/remote-configs/apply", h.postRemoteConfigApply)
 		r.Get("/stats", h.getStats)
+		r.Get("/stats/ws", h.getStatsWS)
 	})
 
 	// Frontend (как в Spring: "/" -> index, + /js/**, /css/**, /favicon.ico)
@@ -225,6 +235,64 @@ func (h *Handler) getStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, stats)
+}
+
+// getStatsWS pushes a fresh Stats snapshot to the client right away and then
+// again on every tick, until the socket is closed, so the UI can stay live
+// without polling.
+func (h *Handler) getStatsWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := statsWSUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	ctx := r.Context()
+	interval := h.statsPushInterval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+
+	sendStats := func() bool {
+		stats, err := h.stats.Get(ctx)
+		if err != nil {
+			return true
+		}
+		return conn.WriteJSON(stats) == nil
+	}
+
+	if !sendStats() {
+		return
+	}
+
+	// WriteJSON isn't safe to call concurrently with reads, but we only need
+	// the read loop to notice when the client goes away (close frame, pings,
+	// or a dropped connection).
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-closed:
+			return
+		case <-ticker.C:
+			if !sendStats() {
+				return
+			}
+		}
+	}
 }
 
 func dirExists(p string) bool {

@@ -75,6 +75,7 @@ func main() {
 		cfg.StaticDir,
 		cfg.IgnoreVPNListName,
 		cfg.IgnoreLanToVpnListName,
+		cfg.CollectInterval,
 	)
 	handler := cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
