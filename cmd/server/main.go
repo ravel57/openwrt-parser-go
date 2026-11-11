@@ -61,6 +61,7 @@ func main() {
 	connectionsSvc := service.NewConnectionsService(ow, cfg.IgnoreVPNListName, cfg.IgnoreLanToVpnListName)
 	collectSvc := service.NewCollectService(connectionsSvc, pg, cfg.CollectInterval)
 	singBoxSvc := service.NewSingBoxService(ow)
+	remoteConfigSvc := service.NewRemoteConfigService(pg, singBoxSvc, cfg.UltunnelConfigsURL, cfg.UltunnelPlatform)
 
 	go collectSvc.Run(ctx)
 
@@ -68,6 +69,7 @@ func main() {
 		connectionsSvc,
 		collectSvc,
 		singBoxSvc,
+		remoteConfigSvc,
 		cfg.StaticDir,
 		cfg.IgnoreVPNListName,
 		cfg.IgnoreLanToVpnListName,

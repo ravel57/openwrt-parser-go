@@ -17,6 +17,7 @@ type Handler struct {
 	connections            *service.ConnectionsService
 	collect                *service.CollectService
 	singBox                *service.SingBoxService
+	remoteConfig           *service.RemoteConfigService
 	staticDir              string
 	ignoreVPNListName      string
 	ignoreLanToVpnListName string
@@ -26,6 +27,7 @@ func NewHandler(
 	connections *service.ConnectionsService,
 	collect *service.CollectService,
 	singBox *service.SingBoxService,
+	remoteConfig *service.RemoteConfigService,
 	staticDir string,
 	ignoreVPNListName string,
 	ignoreLanToVpnListName string,
@@ -34,6 +36,7 @@ func NewHandler(
 		connections:            connections,
 		collect:                collect,
 		singBox:                singBox,
+		remoteConfig:           remoteConfig,
 		staticDir:              staticDir,
 		ignoreVPNListName:      ignoreVPNListName,
 		ignoreLanToVpnListName: ignoreLanToVpnListName,
@@ -63,6 +66,10 @@ func (h *Handler) Router() http.Handler {
 		r.Delete("/address-lists/{listName}", h.deleteAddressList)
 		r.Get("/sing-box/config", h.getSingBoxConfig)
 		r.Post("/sing-box/config", h.postSingBoxConfig)
+		r.Get("/remote-configs/secret-key", h.getRemoteConfigSecretKey)
+		r.Post("/remote-configs/secret-key", h.postRemoteConfigSecretKey)
+		r.Get("/remote-configs/servers", h.getRemoteConfigServers)
+		r.Post("/remote-configs/apply", h.postRemoteConfigApply)
 	})
 
 	// Frontend (как в Spring: "/" -> index, + /js/**, /css/**, /favicon.ico)
@@ -138,6 +145,68 @@ func (h *Handler) postSingBoxConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,
 		"fileName":   filepath.Base(header.Filename),
+		"configured": status.Configured,
+		"path":       status.Path,
+		"size":       status.Size,
+		"running":    status.Running,
+	})
+}
+
+func (h *Handler) getRemoteConfigSecretKey(w http.ResponseWriter, r *http.Request) {
+	configured, err := h.remoteConfig.HasSecretKey(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"configured": configured})
+}
+
+type secretKeyReq struct {
+	SecretKey string `json:"secretKey"`
+}
+
+func (h *Handler) postRemoteConfigSecretKey(w http.ResponseWriter, r *http.Request) {
+	var req secretKeyReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	if err := h.remoteConfig.SetSecretKey(r.Context(), req.SecretKey); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (h *Handler) getRemoteConfigServers(w http.ResponseWriter, r *http.Request) {
+	servers, err := h.remoteConfig.ListServers(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, servers)
+}
+
+type applyRemoteConfigReq struct {
+	Server   string `json:"server"`
+	Protocol string `json:"protocol"`
+}
+
+func (h *Handler) postRemoteConfigApply(w http.ResponseWriter, r *http.Request) {
+	var req applyRemoteConfigReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON"})
+		return
+	}
+	status, err := h.remoteConfig.ApplyConfig(r.Context(), req.Server, req.Protocol)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"server":     req.Server,
+		"protocol":   req.Protocol,
 		"configured": status.Configured,
 		"path":       status.Path,
 		"size":       status.Size,

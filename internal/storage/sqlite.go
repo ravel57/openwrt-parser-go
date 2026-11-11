@@ -50,6 +50,27 @@ func New(ctx context.Context, dsn string) (*Sqlite, error) {
 
 func (p *Sqlite) Close() { _ = p.db.Close() }
 
+func (p *Sqlite) GetSetting(ctx context.Context, key string) (string, bool, error) {
+	var value string
+	err := p.db.QueryRowContext(ctx, `select value from settings where key = ?`, key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return value, true, nil
+}
+
+func (p *Sqlite) SetSetting(ctx context.Context, key, value string) error {
+	_, err := p.db.ExecContext(ctx, `
+		insert into settings (key, value)
+		values (?, ?)
+		on conflict(key) do update set value = excluded.value
+	`, key, value)
+	return err
+}
+
 func (p *Sqlite) SaveAll(ctx context.Context, items []domain.Connection) error {
 	if len(items) == 0 {
 		return nil

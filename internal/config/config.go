@@ -24,6 +24,9 @@ type Config struct {
 	SingBoxConfigPath      string
 	SingBoxApplyCommand    string
 
+	UltunnelConfigsURL string
+	UltunnelPlatform   string
+
 	IgnoreVPNListName       string
 	IgnoreLanToVpnListName  string
 	IgnoreVPNInterface      string
@@ -118,6 +121,15 @@ func Load() Config {
 		singBoxApplyCommand = "/usr/libexec/lan-mode-vpn-setup"
 	}
 
+	ultunnelConfigsURL := strings.TrimSpace(os.Getenv("APP_ULTUNNEL_CONFIGS_URL"))
+	if ultunnelConfigsURL == "" {
+		ultunnelConfigsURL = "http://admin.ultunnel.ru/api/v1/get-users-proxy-servers-singbox"
+	}
+	ultunnelPlatform := strings.TrimSpace(os.Getenv("APP_ULTUNNEL_PLATFORM"))
+	if ultunnelPlatform == "" {
+		ultunnelPlatform = "desktop"
+	}
+
 	return Config{
 		HTTPPort:                port,
 		SqliteDSN:               strings.TrimSpace(os.Getenv("APP_SQLITE_DSN")),
@@ -133,6 +145,8 @@ func Load() Config {
 		OpenWrtDNSLogLines:      envInt("APP_OPENWRT_DNS_LOG_LINES", 4000),
 		SingBoxConfigPath:       singBoxConfigPath,
 		SingBoxApplyCommand:     singBoxApplyCommand,
+		UltunnelConfigsURL:      ultunnelConfigsURL,
+		UltunnelPlatform:        ultunnelPlatform,
 		IgnoreVPNListName:       ignoreVPN,
 		IgnoreLanToVpnListName:  ignoreClient,
 		IgnoreVPNInterface:      ignoreVPNInterface,
