@@ -117,6 +117,20 @@ func TestRemoteConfigApplyConfigInstallsMatchingProtocol(t *testing.T) {
 		t.Fatalf("installed wrong config: %s", runner.input)
 	}
 
+	servers, err := svc.ListServers(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || len(servers[0].Configs) != 2 {
+		t.Fatalf("unexpected servers: %+v", servers)
+	}
+	for _, cfg := range servers[0].Configs {
+		wantActive := cfg.Protocol == "hysteria2"
+		if cfg.Active != wantActive {
+			t.Fatalf("protocol %s: active=%v, want %v", cfg.Protocol, cfg.Active, wantActive)
+		}
+	}
+
 	if _, err := svc.ApplyConfig(context.Background(), "France", "does-not-exist"); err == nil {
 		t.Fatal("expected error for unknown protocol")
 	}

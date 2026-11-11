@@ -14,7 +14,11 @@ import (
 	"openwrt-parser-go/internal/openwrt"
 )
 
-const settingKeyUltunnelSecretKey = "ultunnel_secret_key"
+const (
+	settingKeyUltunnelSecretKey      = "ultunnel_secret_key"
+	settingKeyUltunnelActiveServer   = "ultunnel_active_server"
+	settingKeyUltunnelActiveProtocol = "ultunnel_active_protocol"
+)
 
 type SettingsStore interface {
 	GetSetting(ctx context.Context, key string) (string, bool, error)
@@ -23,6 +27,7 @@ type SettingsStore interface {
 
 type RemoteServerConfig struct {
 	Protocol string `json:"protocol"`
+	Active   bool   `json:"active"`
 }
 
 type RemoteServer struct {
@@ -83,15 +88,36 @@ func (s *RemoteConfigService) ListServers(ctx context.Context) ([]RemoteServer, 
 		return nil, err
 	}
 
+	activeServer, activeProtocol, err := s.activeSelection(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	servers := make([]RemoteServer, 0, len(raw))
 	for _, item := range raw {
 		configs := make([]RemoteServerConfig, 0, len(item.Configs))
 		for _, c := range item.Configs {
-			configs = append(configs, RemoteServerConfig{Protocol: detectProtocol(c)})
+			protocol := detectProtocol(c)
+			configs = append(configs, RemoteServerConfig{
+				Protocol: protocol,
+				Active:   item.Server == activeServer && protocol == activeProtocol,
+			})
 		}
 		servers = append(servers, RemoteServer{Name: item.Server, Configs: configs})
 	}
 	return servers, nil
+}
+
+func (s *RemoteConfigService) activeSelection(ctx context.Context) (server, protocol string, err error) {
+	server, _, err = s.store.GetSetting(ctx, settingKeyUltunnelActiveServer)
+	if err != nil {
+		return "", "", err
+	}
+	protocol, _, err = s.store.GetSetting(ctx, settingKeyUltunnelActiveProtocol)
+	if err != nil {
+		return "", "", err
+	}
+	return server, protocol, nil
 }
 
 // ApplyConfig re-fetches the remote list, picks the config matching
@@ -115,7 +141,17 @@ func (s *RemoteConfigService) ApplyConfig(ctx context.Context, serverName, proto
 		}
 		for _, c := range item.Configs {
 			if detectProtocol(c) == protocol {
-				return s.singBox.Install(ctx, []byte(c))
+				status, err := s.singBox.Install(ctx, []byte(c))
+				if err != nil {
+					return openwrt.SingBoxStatus{}, err
+				}
+				if err := s.store.SetSetting(ctx, settingKeyUltunnelActiveServer, serverName); err != nil {
+					return openwrt.SingBoxStatus{}, err
+				}
+				if err := s.store.SetSetting(ctx, settingKeyUltunnelActiveProtocol, protocol); err != nil {
+					return openwrt.SingBoxStatus{}, err
+				}
+				return status, nil
 			}
 		}
 		return openwrt.SingBoxStatus{}, fmt.Errorf("protocol %q is not available for server %q", protocol, serverName)
